@@ -46,7 +46,7 @@ bool launch_in_user_session(const wchar_t* exe_path, const wchar_t* action_arg,
     DWORD ec = 0;
     if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_OBJECT_0)
         GetExitCodeProcess(pi.hProcess, &ec);
-    else TerminateProcess(pi.hProcess, 1);
+    else { TerminateProcess(pi.hProcess, 1); ec = 1; }
     CloseHandle(pi.hProcess);
     debug::log("SB: done ec=%lu", ec);
     return ec == 0;

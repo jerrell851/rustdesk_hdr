@@ -91,14 +91,20 @@ bool query_hdr_state() {
     return false;
 }
 
+static void kb_set_hdr(bool enable) {
+    bool current = query_hdr_state();
+    debug::log("HDR kb: current=%s want=%s", current ? "ON" : "OFF", enable ? "ON" : "OFF");
+    if (current != enable) send_win_alt_b();
+}
+
 bool set_hdr_enabled(bool enable) {
     debug::log("HDR set_hdr_enabled(%s) force_keyboard=%d", enable ? "ON" : "OFF", g_force_keyboard);
-    if (g_force_keyboard) { debug::log("HDR: using keyboard fallback"); send_win_alt_b(); return true; }
+    if (g_force_keyboard) { kb_set_hdr(enable); return true; }
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (!enum_paths(paths, modes)) {
-        debug::log("HDR: enum_paths failed, using keyboard fallback");
-        send_win_alt_b(); return true;
+        debug::log("HDR: enum_paths failed, keyboard fallback");
+        kb_set_hdr(enable); return true;
     }
     debug::log("HDR: found %zu active display paths", paths.size());
 
@@ -111,15 +117,13 @@ bool set_hdr_enabled(bool enable) {
         gi.header.adapterId = p.targetInfo.adapterId;
         gi.header.id = p.targetInfo.id;
         if (DisplayConfigGetDeviceInfo(&gi.header) != ERROR_SUCCESS) {
-            debug::log("HDR: DisplayConfigGetDeviceInfo failed for adapter %08x:%08x id %u",
-                       p.targetInfo.adapterId.LowPart, p.targetInfo.adapterId.HighPart, p.targetInfo.id);
+            debug::log("HDR: DisplayConfigGetDeviceInfo failed for id %u", p.targetInfo.id);
             continue;
         }
         apiOk = true;
         bool supported = (gi.value & 0x1) != 0;
         bool enabled   = (gi.value & 0x2) != 0;
-        debug::log("HDR: display id=%u supported=%d enabled=%d value=%08x",
-                   p.targetInfo.id, supported, enabled, gi.value);
+        debug::log("HDR: id=%u supported=%d enabled=%d value=%08x", p.targetInfo.id, supported, enabled, gi.value);
         if (!supported) continue;
         if (enabled == enable) { changed = true; continue; }
 
@@ -130,14 +134,9 @@ bool set_hdr_enabled(bool enable) {
         si.header.adapterId = p.targetInfo.adapterId;
         si.header.id = p.targetInfo.id;
         si.enableAdvancedColor = enable ? 1 : 0;
-        LONG ret = DisplayConfigSetDeviceInfo(&si.header);
-        debug::log("HDR: DisplayConfigSetDeviceInfo result=%ld", ret);
-        if (ret == ERROR_SUCCESS) changed = true;
+        if (DisplayConfigSetDeviceInfo(&si.header) == ERROR_SUCCESS) changed = true;
     }
-    if (!apiOk) {
-        debug::log("HDR: API not available, keyboard fallback");
-        send_win_alt_b(); return true;
-    }
+    if (!apiOk) { kb_set_hdr(enable); return true; }
     debug::log("HDR: set_hdr_enabled done, changed=%d", changed);
     return changed;
 }
