@@ -1,0 +1,12 @@
+build/
+out/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.log
+RustDeskHdrService_debug*.log
+.vs/
+.vscode/
+CMakeUserPresets.json
+CLAUDE.md
