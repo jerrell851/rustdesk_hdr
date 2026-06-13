@@ -9,28 +9,21 @@
 #include "cm_log_watcher.h"
 #include "debug.h"
 
-static const wchar_t HELP_TITLE[] = L"RustDesk HDR 监控服务"; // 监控服务
-static const wchar_t HELP_TEXT[] =
-    L"RustDesk HDR 监控服务 v1.0\n\n"       // 监控服务
-    L"用法：\n"                                    // 用法：
-    L"  RustDeskHdrService.exe --install          安装并启动服务\n"   // 安装并启动服务
-    L"  RustDeskHdrService.exe --uninstall        停止并删除服务\n"   // 停止并删除服务
-    L"  RustDeskHdrService.exe --action status    查询 HDR 状态和连接数\n" // 查询 HDR 状态和连接数
-    L"  RustDeskHdrService.exe --action disable   关闭 HDR\n"        // 关闭 HDR
-    L"  RustDeskHdrService.exe --action enable    开启 HDR\n"        // 开启 HDR
-    L"  RustDeskHdrService.exe --force-keyboard   强制使用键盘快捷键 Win+Alt+B\n" // 强制使用键盘快捷键
-    L"  RustDeskHdrService.exe --debug            开启调试日志\n"      // 开启调试日志
-    L"\n"
-    L"双击 EXE 直接运行为 Windows 服务模式。\n" // 双击 EXE 直接运行为 Windows 服务模式
-    L"命令行参数优先于服务模式。";           // 命令行参数优先于服务模式
-
-// Show help in GUI mode (MessageBox) or console mode (printf)
-void show_help_gui() {
-    MessageBoxW(nullptr, HELP_TEXT, HELP_TITLE, MB_OK | MB_ICONINFORMATION);
+// ── Service status check for --action ──────────────────────────
+static void check_service_status() {
+    if (install_mode::is_service_installed()) {
+        if (!install_mode::is_service_running()) {
+            printf("\n  NOTE: service installed but not running.\n"
+                   "        HDR will NOT auto-switch on RustDesk connect.\n\n");
+        }
+    } else {
+        printf("\n  NOTE: service not installed. Run --install first.\n\n");
+    }
 }
 
 static int action_mode(const char* action) {
     if (strcmp(action, "status") == 0) {
+        check_service_status();
         bool on = hdr_control::query_hdr_state();
         debug::log("HDR query: %s", on ? "ON" : "OFF");
         printf("HDR state: %s\n", on ? "ON" : "OFF");
@@ -47,8 +40,11 @@ static int action_mode(const char* action) {
         return 0;
     }
     if (strcmp(action, "disable") == 0) {
+        check_service_status();
+        printf("Mode: %s\n", hdr_control::get_force_keyboard_mode()
+               ? "keyboard (Win+Alt+B)" : "DisplayConfig API");
         printf("Disabling HDR...\n");
-        debug::log("HDR action: disable");
+        debug::log("HDR action: disable force_kb=%d", hdr_control::get_force_keyboard_mode());
         hdr_control::set_hdr_enabled(false);
         bool st = hdr_control::query_hdr_state();
         debug::log("HDR after disable: %s", st ? "ON" : "OFF");
@@ -56,8 +52,11 @@ static int action_mode(const char* action) {
         return st ? 1 : 0;
     }
     if (strcmp(action, "enable") == 0) {
+        check_service_status();
+        printf("Mode: %s\n", hdr_control::get_force_keyboard_mode()
+               ? "keyboard (Win+Alt+B)" : "DisplayConfig API");
         printf("Enabling HDR...\n");
-        debug::log("HDR action: enable");
+        debug::log("HDR action: enable force_kb=%d", hdr_control::get_force_keyboard_mode());
         hdr_control::set_hdr_enabled(true);
         bool st = hdr_control::query_hdr_state();
         debug::log("HDR after enable: %s", st ? "ON" : "OFF");
@@ -68,32 +67,53 @@ static int action_mode(const char* action) {
     return 1;
 }
 
+// ── Reconfigure helper: prompt --install if no service ─────────
+static int reconf_or_prompt(int dbg, int fk) {
+    if (!install_mode::is_service_installed()) {
+        printf("Service not installed. Run --install first.\n");
+        return 0;
+    }
+    return install_mode::reconfigure_service(dbg, fk);
+}
+
 int main(int argc, char* argv[]) {
-    // Pass 1: global flags
+    // ── Pass 1: global flags (runtime effect only) ─────────────
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--debug") == 0) { debug::init_debug_log(); }
-        if (strcmp(argv[i], "--force-keyboard") == 0) { hdr_control::set_force_keyboard_mode(true); }
+        if (strcmp(argv[i], "--debug") == 0)            { debug::init_debug_log(); }
+        if (strcmp(argv[i], "--force-keyboard") == 0)   { hdr_control::set_force_keyboard_mode(true); }
+        if (strcmp(argv[i], "--no-force-keyboard") == 0){ hdr_control::set_force_keyboard_mode(false); }
     }
 
-    // Pass 2: action flags
+    // ── Pass 2: act first, collect reconfigure intents ─────────
+    int action_result = -1;
+    int reconf_dbg = -1, reconf_fk = -1;  // -1=no change, 0=off, 1=on
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--install") == 0)   { return install_mode::install(); }
         if (strcmp(argv[i], "--uninstall") == 0) { return install_mode::uninstall(); }
-        if (strcmp(argv[i], "--action") == 0 && i + 1 < argc) { return action_mode(argv[++i]); }
-        if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "--force-keyboard") == 0) { /* pass 1 */ }
+        if (strcmp(argv[i], "--action") == 0 && i + 1 < argc) {
+            action_result = action_mode(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--debug") == 0)            { reconf_dbg = 1; }
+        else if (strcmp(argv[i], "--no-debug") == 0)         { reconf_dbg = 0; }
+        else if (strcmp(argv[i], "--force-keyboard") == 0)   { reconf_fk  = 1; }
+        else if (strcmp(argv[i], "--no-force-keyboard") == 0){ reconf_fk  = 0; }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("RustDesk HDR Monitor v1.0\n\n"
-                   "  (no args)             Run as Windows Service\n"
-                   "  --install             Install + start service\n"
-                   "  --uninstall           Stop + remove service\n"
-                   "  --action status       Show HDR + connection state\n"
-                   "  --action disable      Turn HDR off\n"
-                   "  --action enable       Turn HDR on\n"
-                   "  --force-keyboard      Use Win+Alt+B instead of API\n"
-                   "  --debug               Write debug log to EXE directory\n");
+                   "  --install / --uninstall     Service management\n"
+                   "  --action status/disable/enable   HDR control\n"
+                   "  --debug / --no-debug             Debug logging on/off\n"
+                   "  --force-keyboard / --no-force-keyboard   HDR toggle method\n");
             return 0;
         }
     }
 
+    // ── Step 3: apply service reconfiguration ──────────────────
+    if (reconf_dbg >= 0) reconf_or_prompt(reconf_dbg, -1);
+    if (reconf_fk  >= 0) reconf_or_prompt(-1, reconf_fk);
+
+    if (action_result >= 0) return action_result;
+
+    // No explicit action: run as service (SCM) or show help
     return service_mode::run(false);
 }

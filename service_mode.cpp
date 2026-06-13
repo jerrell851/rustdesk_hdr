@@ -20,6 +20,7 @@ static FILE* g_log = nullptr;
 static CmLogWatcher g_watcher;
 static CRITICAL_SECTION g_sm_cs;
 static CRITICAL_SECTION g_log_cs;
+static HANDLE g_session_evt = nullptr;  // signaled on session change (watcher retry loop)
 
 enum St { Idle, WaitConnect, Connected, WaitDisconnect };
 static St g_st = Idle;
@@ -181,13 +182,20 @@ static bool start_watcher() {
 }
 
 // ── Service handler ─────────────────────────────────────────
-static DWORD WINAPI handler(DWORD ctrl, DWORD, LPVOID, LPVOID) {
+static DWORD WINAPI handler(DWORD ctrl, DWORD evt_type, LPVOID, LPVOID) {
+    if (ctrl == SERVICE_CONTROL_SESSIONCHANGE) {
+        // User session login/logout — wake watcher retry loop
+        debug::log("SM: session change evt=%lu", evt_type);
+        if (g_session_evt) SetEvent(g_session_evt);
+        return NO_ERROR;
+    }
     if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
         debug::log("SM: service stopping");
         SERVICE_STATUS st = { SERVICE_WIN32_OWN_PROCESS, SERVICE_STOP_PENDING, 0, 1, 3000, 0, 0 };
         SetServiceStatus(g_sh, &st);
         // Stop timer BEFORE blocking HDR restore
         SetEvent(g_stop);
+        if (g_session_evt) { SetEvent(g_session_evt); }  // unblock retry loop
         bool restore;
         EnterCriticalSection(&g_sm_cs);
         restore = g_hdr_off_by_us;
@@ -203,7 +211,8 @@ static VOID WINAPI svc_main(DWORD, LPWSTR*) {
     g_sh = RegisterServiceCtrlHandlerExW(L"RustDeskHdrMonitor", handler, nullptr);
     if (!g_sh) return;
     SERVICE_STATUS st = { SERVICE_WIN32_OWN_PROCESS, SERVICE_RUNNING,
-        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN, 1, 0, 0, 0 };
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE,
+        1, 0, 0, 0 };
     SetServiceStatus(g_sh, &st);
     debug::log("SM: service_main starting"); log_w("Service started");
 
@@ -213,13 +222,40 @@ static VOID WINAPI svc_main(DWORD, LPWSTR*) {
 
     GetModuleFileNameW(nullptr, g_path, MAX_PATH);
     g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_session_evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
 
-    if (!start_watcher()) {
-        log_w("FATAL: Cannot watch cm log directory");
-        CloseHandle(g_stop); g_stop = nullptr;
-        st.dwCurrentState = SERVICE_STOPPED; SetServiceStatus(g_sh, &st);
-        return;
+    // Retry loop: if RustDesk hasn't been run yet, cm log dir won't exist.
+    // Probe RustDesk IPC pipe — if the pipe is alive, RustDesk is running,
+    // which means cm log directory has already been created.
+    // We don't actually communicate, just check existence with CreateFile.
+    // Once found, this loop is never entered again.
+    while (!start_watcher()) {
+        log_w("WARN: cm log dir not found, waiting for RustDesk...");
+        HANDLE waits[2] = { g_stop, g_session_evt };
+        // Wait for stop, session change, or 30s poll interval
+        DWORD r = WaitForMultipleObjects(2, waits, FALSE, 30000);
+        if (r == WAIT_OBJECT_0) {  // g_stop — service is shutting down
+            CloseHandle(g_session_evt); g_session_evt = nullptr;
+            CloseHandle(g_stop); g_stop = nullptr;
+            st.dwCurrentState = SERVICE_STOPPED; SetServiceStatus(g_sh, &st);
+            return;
+        }
+        // Probe RustDesk IPC pipe — if pipe exists, cm log dir is ready.
+        // Only ERROR_FILE_NOT_FOUND definitively means "no pipe".
+        // Any other result (success, busy, access-denied) → pipe is there.
+        HANDLE hPipe = CreateFileW(L"\\\\.\\pipe\\RustDesk\\query",
+            GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hPipe != INVALID_HANDLE_VALUE) {
+            CloseHandle(hPipe);
+            log_w("RustDesk pipe detected, retrying watcher...");
+        } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+            char tmp[80]; snprintf(tmp, sizeof(tmp),
+                "RustDesk pipe detected (err=%lu), retrying watcher...", GetLastError());
+            log_w(tmp);
+        }
     }
+    CloseHandle(g_session_evt); g_session_evt = nullptr;
 
     HANDLE hTimer = CreateThread(nullptr, 0, timer_thread, nullptr, 0, nullptr);
     WaitForSingleObject(g_stop, INFINITE);
@@ -245,14 +281,20 @@ int run(bool) {
         if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
             MessageBoxW(nullptr,
                 L"RustDesk HDR 监控服务 v1.0\n\n"
-                L"用法：\n"
-                L"  RustDeskHdrService.exe --install          安装并启动服务\n"
-                L"  RustDeskHdrService.exe --uninstall        停止并删除服务\n"
-                L"  RustDeskHdrService.exe --action status    查询 HDR 状态和连接数\n"
-                L"  RustDeskHdrService.exe --action disable   关闭 HDR\n"
-                L"  RustDeskHdrService.exe --action enable    开启 HDR\n"
-                L"  RustDeskHdrService.exe --debug            开启调试日志\n"
-                L"\nL如需后台自动运行，请使用 --install 安装为 Windows 服务。",
+                L"服务管理：\n"
+                L"  --install              安装并启动服务\n"
+                L"  --uninstall            停止并删除服务\n"
+                L"\n手动控制：\n"
+                L"  --action status        查询 HDR 状态和连接数\n"
+                L"  --action disable       关闭 HDR\n"
+                L"  --action enable        开启 HDR\n"
+                L"\n调试日志：\n"
+                L"  --debug                开启调试日志\n"
+                L"  --no-debug             关闭调试日志\n"
+                L"\nHDR 切换方式：\n"
+                L"  --force-keyboard       键盘模式 (Win+Alt+B)\n"
+                L"  --no-force-keyboard    API 模式 (默认)\n"
+                L"\n以上参数可组合使用，需管理员权限。",
                 L"RustDesk HDR 监控服务", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
